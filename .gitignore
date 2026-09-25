@@ -1,0 +1,14 @@
+# 本机构建/运行产物
+/tlsdump.exe
+/wintun.dll
+/tun.log
+/tun_debug.log
+/tun.pid
+
+# 根 CA（含私钥，绝不提交）
+/ca/
+
+# wintun.dll 不入库：CI 构建 Windows 目标前会从 wintun.net 官方包
+# 按目标架构拉取（见 .github/workflows/build.yml）；
+# 本地 Windows 构建需手动放置，见 README「构建」一节。
+/internal/tun/wintun.dll

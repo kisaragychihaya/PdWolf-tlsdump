@@ -1,0 +1,71 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: darwin, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.1"
+          cache: true
+
+      # Windows builds embed wintun.dll via go:embed. Always fetch the official
+      # signed DLL for the target architecture instead of relying on the copy
+      # committed in the repo (which is amd64-only).
+      - name: Fetch official wintun.dll
+        if: matrix.goos == 'windows'
+        run: |
+          curl -sSL -o wintun.zip https://www.wintun.net/builds/wintun-0.14.1.zip
+          unzip -o wintun.zip
+          cp "wintun/bin/${{ matrix.goarch }}/wintun.dll" internal/tun/wintun.dll
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          suffix=""
+          if [ "${{ matrix.goos }}" = "windows" ]; then suffix=".exe"; fi
+          go build -trimpath -ldflags="-s -w" \
+            -o "dist/tlsdump-${{ matrix.goos }}-${{ matrix.goarch }}${suffix}" \
+            ./cmd/tlsdump
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tlsdump-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
