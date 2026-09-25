@@ -24,6 +24,45 @@ cp wintun/bin/amd64/wintun.dll internal/tun/wintun.dll   # arm64 构建取 bin/a
 
 GitHub Actions 的 Windows 构建会自动完成上述下载（amd64 / arm64 各取对应架构）。
 
+## 配置文件
+
+用 `-config` 指定 YAML 配置文件启动：
+
+```bash
+tlsdump -config config.yaml
+```
+
+```yaml
+mode: proxy              # proxy | tun，默认 proxy
+listen: 127.0.0.1:8080   # proxy 监听地址
+domains:                 # 白名单；每项可以是域名，也可以是域名列表文件路径
+  - example.com
+  - api.example.com
+record: rec.jsonl        # JSONL 输出文件，缺省 stdout
+ca_dir: ./ca
+insecure_skip_verify: false
+body_limit: 16384
+verbose: false
+tun:                     # tun 模式参数（仅 mode: tun 时生效）
+  name: tlsdump
+  mtu: 1420
+  no_route: false
+  physical_iface: ""     # 缺省自动检测
+  exclude_domains: []
+```
+
+优先级：**显式命令行 flag > YAML > flag 默认值**。
+
+**热重载**：`-config` 模式下程序每 2 秒检查一次文件变化，以下字段改动不重启即生效：
+
+- `domains`（白名单整体替换）
+- `record`（切换到新文件，旧文件退出时关闭）
+- `body_limit`
+- `insecure_skip_verify`
+- `verbose`
+
+`mode`、`listen`、`ca_dir`、`tun.*` 是启动时一次性生效的字段，改动会被记录 Warn 日志并忽略，需重启生效。配置文件语法错误时程序记 Error 日志并沿用旧配置，修复后下个周期自动生效。从文件中删除 `body_limit` 字段会保持当前值不变（不会归零）；`domains` 重载为空列表会被拒绝并沿用旧白名单。
+
 ## 用法
 
 ```bash
@@ -46,6 +85,7 @@ tlsdump -v -insecure-skip-verify -body-limit 65536 ...
 
 | 参数 | 说明 |
 |---|---|
+| `-config` | YAML 配置文件路径；设置后监视文件变化并热重载可重载字段（见上文） |
 | `-mode` | `proxy`（默认）或 `tun` |
 | `-listen` | 代理监听地址，默认 `127.0.0.1:8080` |
 | `-domains` | 逗号分隔域名，或域名列表文件路径 |

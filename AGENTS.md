@@ -22,13 +22,13 @@ go test ./...         # 运行测试
 ```
 
 - 无 Makefile、无 linter 配置；标准 Go 工具链即可。CI 为 GitHub Actions（`.github/workflows/build.yml`）：push 到 main / tag `v*` / 手动触发时交叉编译 windows amd64+arm64、linux amd64+arm64、darwin arm64 并上传 artifact（tag 时自动发 Release）。
-- 主要依赖（见 `go.mod`）：`gvisor.dev/gvisor`（用户态 TCP/IP 协议栈，tun 模式核心）、`golang.zx2c4.com/wireguard`（tun 设备抽象）、`golang.org/x/net`（HTTP/2）、`golang.org/x/sys`。
+- 主要依赖（见 `go.mod`）：`gvisor.dev/gvisor`（用户态 TCP/IP 协议栈，tun 模式核心）、`golang.zx2c4.com/wireguard`（tun 设备抽象）、`golang.org/x/net`（HTTP/2）、`golang.org/x/sys`、`gopkg.in/yaml.v3`（配置文件解析）。
 - Windows 下 `internal/tun/wintun_windows.go` 通过 `//go:embed wintun.dll` 内嵌驱动 DLL，构建产物运行时会自动释放到可执行文件旁。**该 DLL 不入库**（已 gitignore）：CI 构建 Windows 目标前会从 wintun.net 官方包按目标架构下载到 `internal/tun/wintun.dll`；本地 Windows 构建需手动放置（见 README「构建」一节）。仓库根目录的 `wintun.dll` 是运行时释放产物，与嵌入的 DLL 是同一份文件。
 
 ## 代码组织
 
 ```
-cmd/tlsdump/main.go        入口：flag 解析、组装各组件、按 -mode 启动 proxy 或 tun
+cmd/tlsdump/main.go        入口：flag 解析、YAML 配置合并（显式 flag > YAML > 默认值）、组装各组件、按 -mode 启动 proxy 或 tun
 internal/
   proxy/proxy.go           proxy 模式前端：HTTP/CONNECT 代理，读首个请求后交给 mitm
   tun/tun.go               tun 模式前端：建 tun 设备 + gVisor netstack，接管 TCP/UDP
@@ -40,6 +40,8 @@ internal/
   certmgr/manager.go       本地根 CA（RSA-2048，./ca/ca.crt + ca.key）与按域名动态签发叶子证书（内存缓存）
   filter/filter.go         域名白名单匹配（后缀匹配，含子域名，大小写不敏感）
   record/record.go         JSONL 记录器：每行一条 Entry；body 超限时截断；非 UTF-8 body 走 base64
+  config/config.go         YAML 配置加载/校验 + Diff（可热重载字段 vs 需重启字段）
+  config/watch.go          配置文件 mtime 轮询（2s），变化则回调（解析失败沿用旧配置）
 ```
 
 架构要点：
@@ -51,6 +53,7 @@ internal/
 - 转发前剥离 hop-by-hop 头；客户端未带 User-Agent 时不注入默认头（`Header["User-Agent"] = nil` 抑制 `Request.Write` 的默认注入）。
 - tun 模式：netstack 只接管 IPv4；出口连接必须通过 `newBoundDialer` 绑定物理网卡，否则流量会绕回 tun 形成回路；UDP 按原目的地址双向转发，空闲 2 分钟断开。
 - 记录通过 `record.Logger`（mutex 串行化写）输出，`-record` 缺省写到 stdout。
+- 热重载（`-config`）：`mitm.Handler` 的白名单/记录器/body 上限/上游 TLS 校验存放在 `atomic.Pointer[mitmRuntime]` 中，经 `SetRuntime` 整体原子替换；可重载字段为 `domains`、`record`、`body_limit`、`insecure_skip_verify`、`verbose`，`mode`/`listen`/`ca_dir`/`tun.*` 改动只记 Warn 需重启。切换 `record` 文件时旧文件保持打开到进程退出，避免与在途 `Log` 写竞争。
 
 ## 代码风格约定
 
@@ -62,9 +65,10 @@ internal/
 
 ## 测试
 
-- 测试很少，只有 `internal/tun` 有两个：
+- 测试很少：`internal/tun` 两个、`internal/config` 一组：
   - `netstack_test.go`：无 build tag，全平台可跑。用 `channel.Endpoint` 构造与 `Run` 相同的 netstack 配置，注入手工构造的 TCP 包完成三次握手并验证双向数据流。**不依赖真实 tun 设备和特权**。
   - `gateway_windows_test.go`（`//go:build windows`）：查询名为 `WLAN` 的网卡网关，依赖真实网络环境，无 WLAN 网卡的机器会失败。
+  - `config/config_test.go`：YAML 加载（含未知字段拒绝）、`Validate`、`Diff` 的可重载/需重启分类。
 - 其余包（`mitm` / `proxy` / `filter` / `record` / `certmgr`）目前没有测试；改动这些包时如需验证，优先端到端跑一遍：proxy 模式下 `curl -x 127.0.0.1:8080 --cacert ca/ca.crt https://<白名单域名>/`（Windows 的 curl 还需 `--ssl-no-revoke`），检查输出的 JSONL 记录。
 - 手动验证 tun 模式需管理员/root，且**不要与其他 TUN 类工具（如 Clash TUN 模式）同时运行**；异常退出后用 `-tun-reset` 清理残留路由。
 

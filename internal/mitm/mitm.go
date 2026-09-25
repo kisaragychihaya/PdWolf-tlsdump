@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/http2"
@@ -36,15 +37,40 @@ var errNotTLS = errors.New("not a TLS handshake record")
 
 // Handler classifies and processes one client connection.
 type Handler struct {
-	CertMgr            *certmgr.Manager
-	Filter             *filter.Filter
-	Log                *record.Logger
-	BodyLimit          int64
-	DialTimeout        time.Duration
-	InsecureSkipVerify bool
+	CertMgr     *certmgr.Manager
+	DialTimeout time.Duration
 	// Dialer optionally overrides outbound dialing (tun mode binds it to a
 	// physical interface). Nil means use a default dialer.
 	Dialer *net.Dialer
+
+	// rt is the hot-swappable runtime configuration (whitelist, logger, body
+	// limit, upstream TLS verification); replaced atomically on config reload.
+	rt atomic.Pointer[mitmRuntime]
+}
+
+// mitmRuntime is the subset of Handler state that may change at runtime via
+// SetRuntime (YAML config hot reload).
+type mitmRuntime struct {
+	filter             *filter.Filter
+	log                *record.Logger
+	bodyLimit          int64
+	insecureSkipVerify bool
+}
+
+// SetRuntime atomically swaps the reloadable configuration; in-flight and
+// future requests pick up the new values.
+func (h *Handler) SetRuntime(f *filter.Filter, l *record.Logger, bodyLimit int64, insecureSkipVerify bool) {
+	h.rt.Store(&mitmRuntime{filter: f, log: l, bodyLimit: bodyLimit, insecureSkipVerify: insecureSkipVerify})
+}
+
+// runtime returns the current reloadable configuration.
+func (h *Handler) runtime() *mitmRuntime {
+	if rc := h.rt.Load(); rc != nil {
+		return rc
+	}
+	// Zero-value Handler (SetRuntime not yet called): degrade to closed
+	// defaults instead of panicking.
+	return &mitmRuntime{filter: filter.Parse(nil), log: record.New(io.Discard, 0)}
 }
 
 // BufferedConn keeps bytes already read from the underlying connection
@@ -96,6 +122,8 @@ func (h *Handler) HandleConn(ctx context.Context, conn net.Conn, dstAddr string,
 		}
 	}
 
+	rc := h.runtime()
+
 	_ = bc.SetReadDeadline(time.Now().Add(sniffTimeout))
 	head, err := bc.Reader.Peek(5)
 	if err != nil && len(head) == 0 {
@@ -114,7 +142,7 @@ func (h *Handler) HandleConn(ctx context.Context, conn net.Conn, dstAddr string,
 		if host == "" {
 			host = dstHost(dstAddr)
 		}
-		if !h.Filter.Match(host) {
+		if !rc.filter.Match(host) {
 			slog.Debug("bypass TLS", "sni", sni, "host", host, "dst", dstAddr)
 			h.bypass(ctx, bc, dstAddr, nil)
 			return
@@ -208,7 +236,7 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 	var reqRaw []byte
 	var reqTrunc bool
 	if req.Body != nil {
-		reqRaw, reqTrunc, _ = record.ReadBody(req.Body, h.BodyLimit)
+		reqRaw, reqTrunc, _ = record.ReadBody(req.Body, h.runtime().bodyLimit)
 		_ = req.Body.Close()
 	}
 
@@ -230,7 +258,7 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 	}
 	defer resp.Body.Close()
 
-	lb := &limitedBuffer{limit: h.BodyLimit}
+	lb := &limitedBuffer{limit: h.runtime().bodyLimit}
 	respBody := io.TeeReader(resp.Body, lb)
 
 	wh := w.Header()
@@ -260,7 +288,7 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 		RespBody:    record.EncodeBody(lb.bytes()),
 		RespTrunc:   lb.truncated(),
 	}
-	h.Log.Log(e)
+	h.runtime().log.Log(e)
 
 	if copyErr != nil {
 		slog.Debug("h2 response copy failed", "host", host, "err", copyErr)
@@ -275,7 +303,7 @@ func (h *Handler) handlePlainHTTP(ctx context.Context, bc *bufferedConn, dstAddr
 	if err != nil {
 		return
 	}
-	if !h.Filter.Match(req.Host) {
+	if !h.runtime().filter.Match(req.Host) {
 		slog.Debug("bypass HTTP", "host", req.Host, "dst", dstAddr)
 		h.bypass(ctx, bc, dstAddr, req)
 		return
@@ -315,7 +343,7 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 		var reqRaw []byte
 		var reqTrunc bool
 		if req.Body != nil {
-			reqRaw, reqTrunc, _ = record.ReadBody(req.Body, h.BodyLimit)
+			reqRaw, reqTrunc, _ = record.ReadBody(req.Body, h.runtime().bodyLimit)
 			_ = req.Body.Close()
 		}
 		reqHdr := req.Header.Clone()
@@ -340,7 +368,7 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 			return
 		}
 
-		lb := &limitedBuffer{limit: h.BodyLimit}
+		lb := &limitedBuffer{limit: h.runtime().bodyLimit}
 		resp.Body = io.NopCloser(io.TeeReader(resp.Body, lb))
 		writeErr := resp.Write(clientW)
 		resp.Body.Close()
@@ -360,7 +388,7 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 			RespBody:    record.EncodeBody(lb.bytes()),
 			RespTrunc:   lb.truncated(),
 		}
-		h.Log.Log(e)
+		h.runtime().log.Log(e)
 
 		if writeErr != nil || req.Close || resp.Close {
 			return
@@ -432,7 +460,7 @@ func (h *Handler) dialTLS(ctx context.Context, addr, serverName string, alpn []s
 	}
 	tlsConn := tls.Client(raw, &tls.Config{
 		ServerName:         serverName,
-		InsecureSkipVerify: h.InsecureSkipVerify, //nolint:gosec // explicit option for self-signed upstreams
+		InsecureSkipVerify: h.runtime().insecureSkipVerify, //nolint:gosec // explicit option for self-signed upstreams
 		NextProtos:         alpn,
 		MinVersion:         tls.VersionTLS12,
 	})
