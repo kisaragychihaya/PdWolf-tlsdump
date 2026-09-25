@@ -5,7 +5,7 @@ HTTPS 流量解密 + 按域名白名单记录的工具。对域名列表内的�
 ## 模式
 
 - **proxy**：本地 HTTP/CONNECT 代理，`curl -x` 可用。
-- **tun**：创建虚拟网卡（Windows 用 wintun，Linux 用 /dev/net/tun）配合 gVisor netstack 透明接管全网 TCP/UDP 流量。**需要管理员 / root 权限**。
+- **tun**：创建虚拟网卡（Windows 用 wintun，Linux 用 /dev/net/tun，macOS 用 utun）配合 gVisor netstack 透明接管全网 TCP/UDP 流量。**需要管理员 / root 权限**。
 
 ## 构建
 
@@ -105,6 +105,14 @@ tlsdump -v -insecure-skip-verify -body-limit 65536 ...
   ip route del 128.0.0.0/1 dev tlsdump
   ip addr del 198.19.0.1/30 dev tlsdump
   ```
+
+  macOS（root，设备名为内核分配的 utunN，可用 `ifconfig | grep utun` 查看）：
+
+  ```bash
+  route -n delete -net 0.0.0.0/1 -interface utunN
+  route -n delete -net 128.0.0.0/1 -interface utunN
+  ```
+- **macOS 注意事项**：utun 设备名由内核分配（`utunN`），`-tun-name` 在 macOS 上无效；出口绑定使用 IP_BOUND_IF，如出口异常可用 `-tun-physical-iface` 显式指定物理网卡。
 - 上游 TLS 默认严格校验；命中证书 pinning 或上游自签时打开 `-insecure-skip-verify`。
 - **不要与其他 TUN/虚拟网卡类工具同时运行**（如 Clash Verge 的 TUN 模式）：它们使用 fake-ip 网段和同样的 /1 接管路由，互相冲突会导致断网。使用前确保相关进程（含残留的 `clash-core-service.exe` 之类系统服务进程）已退出。
 - **Windows 下 curl 验证 MITM 需要** `--cacert ca/ca.crt --ssl-no-revoke`（schannel 会对无 CRL 的本地 CA 报吊销状态未知）。

@@ -113,7 +113,7 @@ func Run(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	dev, err := tun.CreateTUN(cfg.Name, cfg.MTU)
+	dev, err := tun.CreateTUN(tunCreateName(cfg.Name), cfg.MTU)
 	if err != nil {
 		return fail(err)
 	}

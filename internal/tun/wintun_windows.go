@@ -35,3 +35,7 @@ func preparePlatform(name string) error {
 	tun.WintunStaticRequestedGUID = (*windows.GUID)(unsafe.Pointer(&sum[0]))
 	return nil
 }
+
+// tunCreateName passes the configured name through unchanged: the wintun
+// backend accepts arbitrary adapter names.
+func tunCreateName(name string) string { return name }

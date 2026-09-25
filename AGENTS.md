@@ -9,7 +9,7 @@
 两种运行模式：
 
 - **proxy**（默认）：本地 HTTP/CONNECT 代理，监听 `-listen`（默认 `127.0.0.1:8080`），`curl -x` 可用。
-- **tun**：创建虚拟网卡（Windows 用 wintun，Linux 用 `/dev/net/tun`），配合 gVisor netstack 透明接管全网 IPv4 TCP/UDP 流量。需要管理员 / root 权限。
+- **tun**：创建虚拟网卡（Windows 用 wintun，Linux 用 `/dev/net/tun`，macOS 用内核 utun），配合 gVisor netstack 透明接管全网 IPv4 TCP/UDP 流量。需要管理员 / root 权限。
 
 详细用法、参数表、CA 安装方法、记录格式、注意事项见 `README.md`（中文）。
 
@@ -32,10 +32,10 @@ cmd/tlsdump/main.go        入口：flag 解析、组装各组件、按 -mode �
 internal/
   proxy/proxy.go           proxy 模式前端：HTTP/CONNECT 代理，读首个请求后交给 mitm
   tun/tun.go               tun 模式前端：建 tun 设备 + gVisor netstack，接管 TCP/UDP
-  tun/route_*.go           平台相关：配置/清理系统路由（Windows netsh / Linux ip 命令）
+  tun/route_*.go           平台相关：配置/清理系统路由（Windows netsh / Linux ip / macOS route+ifconfig 命令）
   tun/bind_*.go            平台相关：出口 socket 绑定物理网卡（防路由回路）
   tun/exclude_*.go         平台相关：-tun-exclude-domains 域名豁免（/32 主机路由钉到物理网卡）
-  tun/wintun_*.go          平台相关：Windows 释放内嵌 wintun.dll 并固定网卡 GUID
+  tun/wintun_*.go          平台相关：Windows 释放内嵌 wintun.dll 并固定网卡 GUID；macOS 设备名映射为 utun
   mitm/mitm.go             核心：嗅探首字节 → TLS/明文 HTTP/未知 分类 → 解密转发或 bypass
   certmgr/manager.go       本地根 CA（RSA-2048，./ca/ca.crt + ca.key）与按域名动态签发叶子证书（内存缓存）
   filter/filter.go         域名白名单匹配（后缀匹配，含子域名，大小写不敏感）
@@ -55,7 +55,7 @@ internal/
 ## 代码风格约定
 
 - 代码注释用英文（包注释说明职责，关键 hack 处写明原因，如 SNI 回退、User-Agent 抑制、防路由回路）；`README.md` 与用户-facing 文档用中文。
-- 平台相关代码用 Go build tag 拆分文件：`_windows.go` / `_linux.go` / `_unsupported.go`（`!windows && !linux` 提供 no-op 桩），公共逻辑放 `tun.go`。
+- 平台相关代码用 Go build tag 拆分文件：`_windows.go` / `_linux.go` / `_darwin.go` / `_unsupported.go`（`!windows && !linux && !darwin` 提供 no-op 桩），公共逻辑放 `tun.go`。
 - 日志统一用 `log/slog`；`-v` 打开 Debug 级。Debug 日志的判定关键词（`intercept TLS` / `bypass TLS` / `bypass HTTP` 等）是排查问题的主要手段，改动时保持这些语义。
 - 错误处理：平台路由操作尽量 best-effort（失败记 Warn 不致命），但设备创建、路由配置等关键步骤失败要清理已做的变更（`cleanups` 栈模式，见 `tun.Run`）。
 - 公开符号都有 doc 注释；导出函数保持简短、可测试。
