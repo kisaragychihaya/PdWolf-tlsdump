@@ -73,6 +73,11 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	}
 	// Replay the consumed request so HandleConn sees a faithful stream.
 	var buf bytes.Buffer
+	if _, ok := req.Header["User-Agent"]; !ok {
+		// WriteProxy injects a default User-Agent; suppress it so the
+		// replayed request matches what the client actually sent.
+		req.Header["User-Agent"] = nil
+	}
 	if err := req.WriteProxy(&buf); err != nil {
 		return
 	}

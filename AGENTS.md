@@ -51,6 +51,7 @@ internal/
 - 白名单判定优先用 SNI；无 SNI（如 IP 直连）时回退到目标地址的 host。
 - 解密后的 ALPN 为 `h2` 时按 HTTP/2 处理（`x/net/http2` 起服务端 + Transport），否则按 HTTP/1.1 逐请求转发。
 - 转发前剥离 hop-by-hop 头；客户端未带 User-Agent 时不注入默认头（`Header["User-Agent"] = nil` 抑制 `Request.Write` 的默认注入）。
+- WebSocket（HTTP/1.1 Upgrade 握手）在 `serveHTTP1` 循环内检测（`isWebSocketUpgrade`）：握手按普通 Entry 记录（字段与普通 HTTP 记录一致），剥离后重新补上 `Connection: Upgrade` / `Upgrade: websocket` 再转发；上游回 101 后升级为双向盲转发（`relayWebSocket`），帧内容不解析不记录（代码内有 TODO）。HTTP/2 的 extended CONNECT（RFC 8441）不支持。
 - tun 模式：netstack 只接管 IPv4；出口连接必须通过 `newBoundDialer` 绑定物理网卡，否则流量会绕回 tun 形成回路；UDP 按原目的地址双向转发，空闲 2 分钟断开。
 - 记录通过 `record.Logger`（mutex 串行化写）输出，`-record` 缺省写到 stdout。
 - 热重载（`-config`）：`mitm.Handler` 的白名单/记录器/body 上限/上游 TLS 校验存放在 `atomic.Pointer[mitmRuntime]` 中，经 `SetRuntime` 整体原子替换；可重载字段为 `domains`、`record`、`body_limit`、`insecure_skip_verify`、`verbose`，`mode`/`listen`/`ca_dir`/`tun.*` 改动只记 Warn 需重启。切换 `record` 文件时旧文件保持打开到进程退出，避免与在途 `Log` 写竞争。

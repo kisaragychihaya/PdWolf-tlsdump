@@ -348,6 +348,11 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 		}
 		reqHdr := req.Header.Clone()
 
+		if isWebSocketUpgrade(req) {
+			h.relayWebSocket(clientW, clientR, upstream, upBr, req, reqHdr, reqRaw, reqTrunc, host, mode, clientAddr)
+			return
+		}
+
 		outReq := req
 		outReq.Body = io.NopCloser(bytes.NewReader(reqRaw))
 		outReq.ContentLength = int64(len(reqRaw))
@@ -394,6 +399,99 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 			return
 		}
 	}
+}
+
+// isWebSocketUpgrade reports whether req is a WebSocket opening handshake
+// (RFC 6455): an Upgrade: websocket header plus a Connection token "upgrade".
+func isWebSocketUpgrade(req *http.Request) bool {
+	if !strings.EqualFold(req.Header.Get("Upgrade"), "websocket") {
+		return false
+	}
+	for _, v := range req.Header.Values("Connection") {
+		for _, tok := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), "upgrade") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// relayWebSocket forwards a WebSocket opening handshake with its upgrade
+// headers intact, records the handshake as a single Entry (same JSON shape as
+// plain HTTP records), and on a 101 response blindly relays the upgraded
+// stream in both directions until either side closes.
+func (h *Handler) relayWebSocket(clientW net.Conn, clientR *bufio.Reader, upstream net.Conn, upBr *bufio.Reader, req *http.Request, reqHdr http.Header, reqRaw []byte, reqTrunc bool, host, mode, clientAddr string) {
+	outReq := req
+	outReq.Body = io.NopCloser(bytes.NewReader(reqRaw))
+	outReq.ContentLength = int64(len(reqRaw))
+	outReq.TransferEncoding = nil
+	stripHopByHop(outReq.Header)
+	// stripHopByHop removes the headers that carry the upgrade semantics;
+	// re-assert them so the upstream sees a valid handshake.
+	outReq.Header.Set("Connection", "Upgrade")
+	outReq.Header.Set("Upgrade", "websocket")
+	if _, ok := reqHdr["User-Agent"]; !ok {
+		// Request.Write injects a default User-Agent; suppress it so the
+		// forwarded request matches what the client actually sent.
+		outReq.Header["User-Agent"] = nil
+	}
+	if err := outReq.Write(upstream); err != nil {
+		return
+	}
+
+	resp, err := http.ReadResponse(upBr, req)
+	if err != nil {
+		slog.Debug("read websocket handshake response failed", "host", host, "err", err)
+		return
+	}
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		// ReadResponse may drop hop-by-hop headers from the parsed response;
+		// re-assert the upgrade headers so the client sees a valid 101.
+		resp.Header.Set("Connection", "Upgrade")
+		resp.Header.Set("Upgrade", "websocket")
+	}
+	if err := resp.Write(clientW); err != nil {
+		return
+	}
+
+	e := &record.Entry{
+		Time:        time.Now(),
+		Client:      clientAddr,
+		Mode:        mode,
+		Host:        host,
+		Method:      req.Method,
+		URI:         req.URL.RequestURI(),
+		Status:      resp.StatusCode,
+		ReqHeaders:  reqHdr,
+		RespHeaders: resp.Header.Clone(),
+		ReqBody:     record.EncodeBody(reqRaw),
+		ReqTrunc:    reqTrunc,
+		RespBody:    record.EncodeBody(nil),
+		RespTrunc:   false,
+	}
+	h.runtime().log.Log(e)
+
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		return
+	}
+
+	// TODO: parse and record WebSocket frames. For now only the opening
+	// handshake is recorded; the upgraded stream is blindly relayed.
+	slog.Debug("websocket established, relaying frames", "host", host, "dst", upstream.RemoteAddr().String())
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(upstream, clientR)
+		_ = closeWrite(upstream)
+	}()
+	go func() {
+		defer wg.Done()
+		_, _ = io.Copy(clientW, upBr)
+		_ = closeWrite(clientW)
+	}()
+	wg.Wait()
 }
 
 // bypass blindly relays between conn and the upstream, optionally replaying
