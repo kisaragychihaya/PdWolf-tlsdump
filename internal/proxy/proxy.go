@@ -55,6 +55,16 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(requestTimeout))
 	br := bufio.NewReaderSize(conn, 64*1024)
+	head, err := br.Peek(1)
+	if err != nil {
+		return
+	}
+	// A SOCKS5 greeting starts with version byte 0x05, which is never a valid
+	// start of an HTTP request, so one byte is enough to pick the protocol.
+	if head[0] == socks5Version {
+		s.handleSocks5(ctx, conn, br)
+		return
+	}
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return

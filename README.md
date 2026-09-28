@@ -4,7 +4,7 @@ HTTPS 流量解密 + 按域名白名单记录的工具。对域名列表内的�
 
 ## 模式
 
-- **proxy**：本地 HTTP/CONNECT 代理，`curl -x` 可用。
+- **proxy**：本地代理，同一端口同时支持 HTTP/CONNECT 和 SOCKS5（仅 no-auth + CONNECT 命令，按首字节自动识别），`curl -x` 可用。
 - **tun**：创建虚拟网卡（Windows 用 wintun，Linux 用 /dev/net/tun，macOS 用 utun）配合 gVisor netstack 透明接管全网 TCP/UDP 流量。**需要管理员 / root 权限**。
 
 ## 构建
@@ -102,7 +102,7 @@ tlsdump -v -insecure-skip-verify -body-limit 65536 ...
 首次运行后在 `-ca-dir` 生成根证书 `ca.crt` / `ca.key`。客户端需要信任它：
 
 - **Windows**：双击 `ca.crt` → 安装证书 → 本地计算机 → 受信任的根证书颁发机构（或 `certutil -addstore Root ca.crt`，需管理员）。
-- **curl**：`curl -x 127.0.0.1:8080 --cacert ca/ca.crt https://example.com/`
+- **curl**：`curl -x 127.0.0.1:8080 --cacert ca/ca.crt https://example.com/`（HTTP 代理）；SOCKS5 用 `curl -x socks5h://127.0.0.1:8080 --cacert ca/ca.crt https://example.com/`（`socks5h://` 让代理解析域名，白名单才能命中）。
 - **系统级**：把 `ca.crt` 导入系统信任库后所有客户端无感。
 
 ## 记录格式

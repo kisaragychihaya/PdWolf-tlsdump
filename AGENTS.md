@@ -8,7 +8,7 @@
 
 两种运行模式：
 
-- **proxy**（默认）：本地 HTTP/CONNECT 代理，监听 `-listen`（默认 `127.0.0.1:8080`），`curl -x` 可用。
+- **proxy**（默认）：本地代理，监听 `-listen`（默认 `127.0.0.1:8080`），同一端口同时支持 HTTP/CONNECT 与 SOCKS5（按首字节自动识别；SOCKS5 仅 no-auth + CONNECT），`curl -x` 可用。
 - **tun**：创建虚拟网卡（Windows 用 wintun，Linux 用 `/dev/net/tun`，macOS 用内核 utun），配合 gVisor netstack 透明接管全网 IPv4 TCP/UDP 流量。需要管理员 / root 权限。
 
 详细用法、参数表、CA 安装方法、记录格式、注意事项见 `README.md`（中文）。
@@ -30,7 +30,8 @@ go test ./...         # 运行测试
 ```
 cmd/tlsdump/main.go        入口：flag 解析、YAML 配置合并（显式 flag > YAML > 默认值）、组装各组件、按 -mode 启动 proxy 或 tun
 internal/
-  proxy/proxy.go           proxy 模式前端：HTTP/CONNECT 代理，读首个请求后交给 mitm
+  proxy/proxy.go           proxy 模式前端：HTTP/CONNECT 代理，读首个请求后交给 mitm；按首字节 0x05 分流到 SOCKS5
+  proxy/socks5.go          SOCKS5 握手（RFC 1928，仅 no-auth + CONNECT），成功回包后交给 mitm
   tun/tun.go               tun 模式前端：建 tun 设备 + gVisor netstack，接管 TCP/UDP
   tun/route_*.go           平台相关：配置/清理系统路由（Windows netsh / Linux ip / macOS route+ifconfig 命令）
   tun/bind_*.go            平台相关：出口 socket 绑定物理网卡（防路由回路）
