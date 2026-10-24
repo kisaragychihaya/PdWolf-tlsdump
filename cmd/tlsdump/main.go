@@ -21,6 +21,7 @@ import (
 	"tlsdump/internal/mitm"
 	"tlsdump/internal/proxy"
 	"tlsdump/internal/record"
+	"tlsdump/internal/script"
 	"tlsdump/internal/tun"
 )
 
@@ -42,6 +43,8 @@ type options struct {
 	insecure         bool
 	bodyLimit        int64
 	verbose          bool
+	scriptPath       string
+	scriptTimeout    time.Duration
 	tunName          string
 	tunMTU           int
 	tunNoRoute       bool
@@ -59,6 +62,8 @@ func run() error {
 		caDir            = flag.String("ca-dir", "./ca", "CA certificate directory")
 		insecure         = flag.Bool("insecure-skip-verify", false, "skip upstream TLS verification (pinning/self-signed upstreams)")
 		bodyLimit        = flag.Int64("body-limit", 16384, "max body bytes recorded per request/response")
+		scriptPath       = flag.String("script", "", "JS script for request/response rewriting (empty = disabled)")
+		scriptTimeout    = flag.Duration("script-timeout", script.DefaultTimeout, "JS script execution timeout")
 		tunName          = flag.String("tun-name", "tlsdump", "tun interface name")
 		tunMTU           = flag.Int("tun-mtu", 1420, "tun interface MTU")
 		tunNoRoute       = flag.Bool("tun-no-route", false, "do not modify system routes (manual debugging)")
@@ -106,6 +111,23 @@ func run() error {
 		}
 		return yamlVal
 	}
+	// yamlVal is a duration string (e.g. "5s"); empty, malformed or
+	// non-positive values fall back to the flag value.
+	pickDuration := func(name string, flagVal time.Duration, yamlVal string) time.Duration {
+		if explicit[name] || yamlVal == "" {
+			return flagVal
+		}
+		d, err := time.ParseDuration(yamlVal)
+		if err != nil {
+			slog.Warn("config: invalid duration, using flag/default value",
+				"flag", name, "value", yamlVal, "err", err)
+			return flagVal
+		}
+		if d <= 0 {
+			return flagVal
+		}
+		return d
+	}
 	pickList := func(name, flagSpec string, yamlList []string) []string {
 		if explicit[name] || yamlList == nil {
 			return loadDomainEntries(flagSpec)
@@ -122,6 +144,8 @@ func run() error {
 		insecure:         pickBool("insecure-skip-verify", *insecure, fileCfg.InsecureSkipVerify),
 		bodyLimit:        pickInt64("body-limit", *bodyLimit, fileCfg.BodyLimit),
 		verbose:          pickBool("v", *verbose, fileCfg.Verbose),
+		scriptPath:       pickStr("script", *scriptPath, fileCfg.Script.Path),
+		scriptTimeout:    pickDuration("script-timeout", *scriptTimeout, fileCfg.Script.Timeout),
 		tunName:          pickStr("tun-name", *tunName, fileCfg.Tun.Name),
 		tunMTU:           pickInt("tun-mtu", *tunMTU, fileCfg.Tun.MTU),
 		tunNoRoute:       pickBool("tun-no-route", *tunNoRoute, fileCfg.Tun.NoRoute),
@@ -151,9 +175,22 @@ func run() error {
 	}
 	slog.Info("CA ready", "dir", opts.caDir)
 
+	// The script engine is startup-only: a failed load is fatal rather than a
+	// silent downgrade to no rewriting.
+	var scriptEngine *script.Engine
+	if opts.scriptPath != "" {
+		engine, err := script.NewEngine(opts.scriptPath, opts.scriptTimeout)
+		if err != nil {
+			return fmt.Errorf("load script: %w", err)
+		}
+		scriptEngine = engine
+		slog.Info("script engine ready", "path", opts.scriptPath, "timeout", opts.scriptTimeout)
+	}
+
 	handler := &mitm.Handler{
-		CertMgr:     ca,
-		DialTimeout: 10 * time.Second,
+		CertMgr:      ca,
+		DialTimeout:  10 * time.Second,
+		ScriptEngine: scriptEngine,
 	}
 
 	// Runtime state shared with the config watcher. Every opened record file

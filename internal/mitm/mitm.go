@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,6 +24,7 @@ import (
 	"tlsdump/internal/certmgr"
 	"tlsdump/internal/filter"
 	"tlsdump/internal/record"
+	"tlsdump/internal/script"
 )
 
 const (
@@ -42,6 +44,9 @@ type Handler struct {
 	// Dialer optionally overrides outbound dialing (tun mode binds it to a
 	// physical interface). Nil means use a default dialer.
 	Dialer *net.Dialer
+	// ScriptEngine applies JS request/response rewriting to decrypted traffic.
+	// Nil disables rewriting entirely.
+	ScriptEngine *script.Engine
 
 	// rt is the hot-swappable runtime configuration (whitelist, logger, body
 	// limit, upstream TLS verification); replaced atomically on config reload.
@@ -228,16 +233,19 @@ func (h *Handler) serveH2(ctx context.Context, conn *tls.Conn, dstAddr, sni, hos
 }
 
 func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, req *http.Request, transport *http2.Transport, sni, clientAddr string) {
-	host := req.Host
-	if host == "" {
-		host = sni
-	}
-
 	var reqRaw []byte
 	var reqTrunc bool
 	if req.Body != nil {
 		reqRaw, reqTrunc, _ = record.ReadBody(req.Body, h.runtime().bodyLimit)
 		_ = req.Body.Close()
+	}
+
+	// Rewriting may retarget the request, so the authority is read afterwards.
+	req, reqRaw, reqRewrite := h.rewriteRequest(req, reqRaw)
+
+	host := req.Host
+	if host == "" {
+		host = sni
 	}
 
 	outReq := req.Clone(ctx)
@@ -256,10 +264,17 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 		http.Error(w, "tlsdump upstream error", http.StatusBadGateway)
 		return
 	}
+
+	resp, recordBody, buffered := h.rewriteResponse(reqRewrite, resp)
 	defer resp.Body.Close()
 
 	lb := &limitedBuffer{limit: h.runtime().bodyLimit}
-	respBody := io.TeeReader(resp.Body, lb)
+	respBody := io.Reader(resp.Body)
+	if buffered {
+		_, _ = lb.Write(recordBody)
+	} else {
+		respBody = io.TeeReader(resp.Body, lb)
+	}
 
 	wh := w.Header()
 	for k, vs := range resp.Header {
@@ -269,6 +284,10 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 		for _, v := range vs {
 			wh.Add(k, v)
 		}
+	}
+	if buffered && req.Method != http.MethodHead {
+		// The rewritten body is written verbatim, so its length is authoritative.
+		wh.Set("Content-Length", strconv.FormatInt(resp.ContentLength, 10))
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, copyErr := io.Copy(w, respBody)
@@ -342,16 +361,21 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 		}
 		var reqRaw []byte
 		var reqTrunc bool
+		var reqRewrite *script.RewriteResult
 		if req.Body != nil {
 			reqRaw, reqTrunc, _ = record.ReadBody(req.Body, h.runtime().bodyLimit)
 			_ = req.Body.Close()
 		}
-		reqHdr := req.Header.Clone()
 
+		// The WebSocket handshake is relayed untouched: rewriting it would
+		// desynchronise the frame relay that follows.
 		if isWebSocketUpgrade(req) {
-			h.relayWebSocket(clientW, clientR, upstream, upBr, req, reqHdr, reqRaw, reqTrunc, host, mode, clientAddr)
+			h.relayWebSocket(clientW, clientR, upstream, upBr, req, req.Header.Clone(), reqRaw, reqTrunc, host, mode, clientAddr)
 			return
 		}
+
+		req, reqRaw, reqRewrite = h.rewriteRequest(req, reqRaw)
+		reqHdr := req.Header.Clone()
 
 		outReq := req
 		outReq.Body = io.NopCloser(bytes.NewReader(reqRaw))
@@ -373,8 +397,13 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 			return
 		}
 
+		resp, recordBody, buffered := h.rewriteResponse(reqRewrite, resp)
 		lb := &limitedBuffer{limit: h.runtime().bodyLimit}
-		resp.Body = io.NopCloser(io.TeeReader(resp.Body, lb))
+		if buffered {
+			_, _ = lb.Write(recordBody)
+		} else {
+			resp.Body = io.NopCloser(io.TeeReader(resp.Body, lb))
+		}
 		writeErr := resp.Write(clientW)
 		resp.Body.Close()
 
@@ -399,6 +428,103 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 			return
 		}
 	}
+}
+
+// rewriteRequest applies the matched script rule's request hook, if any. It
+// returns the request to forward upstream, its body, and the result to hand to
+// rewriteResponse. A failing hook is logged and the original traffic forwarded
+// unchanged: a broken script must not break the connection.
+func (h *Handler) rewriteRequest(req *http.Request, body []byte) (*http.Request, []byte, *script.RewriteResult) {
+	if h.ScriptEngine == nil {
+		return req, body, nil
+	}
+	res, err := h.ScriptEngine.MatchAndRewrite(req, body)
+	if err != nil {
+		slog.Warn("script request rewrite failed, forwarding original", "err", err)
+		return req, body, nil
+	}
+	if !res.Matched {
+		return req, body, nil
+	}
+	return res.Request, res.Body, res
+}
+
+// rewriteResponse applies the matched rule's response hook, if any. Hooks see
+// bodies in memory, so the upstream body is drained and closed first and then
+// replaced by a reader over the (possibly rewritten) bytes; buffered reports
+// whether that happened, letting the caller skip re-teeing the body.
+//
+// A gzip/deflate body is decoded before the hook runs and re-encoded after it,
+// so scripts always operate on plaintext. recordBody is the plaintext the hook
+// produced (what callers record); out.Body carries the bytes to send, which are
+// compressed again when the upstream response was.
+//
+// Transfer framing is re-derived from the materialised body: the headers that
+// described the original encoding (Content-Length, Transfer-Encoding) are
+// dropped so Response.Write recomputes them.
+func (h *Handler) rewriteResponse(res *script.RewriteResult, resp *http.Response) (out *http.Response, recordBody []byte, buffered bool) {
+	if h.ScriptEngine == nil || !h.ScriptEngine.HasResponseHook(res) {
+		return resp, nil, false
+	}
+	raw, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil {
+		// The body is gone either way; forward what was read rather than
+		// dropping the response.
+		slog.Debug("script: read response body failed, rewriting partial body", "err", readErr)
+	}
+
+	headerEncoding := resp.Header.Get("Content-Encoding")
+	plain, encoding, decErr := decompressBody(raw, headerEncoding)
+	if decErr != nil {
+		// Undecodable body: forward the upstream bytes untouched rather than
+		// handing binary noise to a hook that could not re-encode faithfully.
+		slog.Warn("script: response decompression failed, sending original", "encoding", headerEncoding, "err", decErr)
+		resp.Body = io.NopCloser(bytes.NewReader(raw))
+		resp.ContentLength = int64(len(raw))
+		resp.TransferEncoding = nil
+		resp.Header.Del("Content-Length")
+		resp.Header.Del("Transfer-Encoding")
+		return resp, raw, true
+	}
+	if encoding == "" {
+		plain = raw
+	} else {
+		// The hook sees plaintext, so the headers must not claim it is encoded;
+		// both are restored after recompression below.
+		resp.Header.Del("Content-Encoding")
+		resp.Header.Del("Content-Length")
+	}
+
+	out, body, err := h.ScriptEngine.RewriteResponse(res, resp, plain)
+	if err != nil {
+		slog.Warn("script response rewrite failed, sending original", "err", err)
+		out, body = resp, plain
+	}
+	recordBody = body
+
+	if encoding != "" {
+		if len(body) == 0 {
+			// HEAD/204 carry no body: keep it empty and only restore the coding
+			// the upstream advertised.
+			out.Header.Set("Content-Encoding", encoding)
+		} else if compressed, err := compressBody(body, encoding); err != nil {
+			// A failing in-memory encoder is practically impossible; send
+			// plaintext without the header rather than mislabel the payload.
+			slog.Warn("script: response recompression failed, sending plaintext", "encoding", encoding, "err", err)
+			out.Header.Del("Content-Encoding")
+		} else {
+			body = compressed
+			out.Header.Set("Content-Encoding", encoding)
+		}
+	}
+
+	out.Body = io.NopCloser(bytes.NewReader(body))
+	out.ContentLength = int64(len(body))
+	out.TransferEncoding = nil
+	out.Header.Del("Content-Length")
+	out.Header.Del("Transfer-Encoding")
+	return out, recordBody, true
 }
 
 // isWebSocketUpgrade reports whether req is a WebSocket opening handshake

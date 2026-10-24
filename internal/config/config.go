@@ -9,6 +9,7 @@ import (
 	"os"
 	"reflect"
 	"slices"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -16,15 +17,25 @@ import (
 // Config mirrors the command-line flags. Only the fields documented as
 // reloadable may change at runtime; everything else is startup-only.
 type Config struct {
-	Mode               string    `yaml:"mode"`                 // proxy | tun
-	Listen             string    `yaml:"listen"`               // proxy listen address
-	Domains            []string  `yaml:"domains"`              // reloadable; each entry: domain or list-file path
-	Record             string    `yaml:"record"`               // reloadable; JSONL output file ("" = stdout)
-	CADir              string    `yaml:"ca_dir"`               // root CA directory
-	InsecureSkipVerify bool      `yaml:"insecure_skip_verify"` // reloadable
-	BodyLimit          int64     `yaml:"body_limit"`           // reloadable
-	Verbose            bool      `yaml:"verbose"`              // reloadable
-	Tun                TunConfig `yaml:"tun"`
+	Mode               string       `yaml:"mode"`                 // proxy | tun
+	Listen             string       `yaml:"listen"`               // proxy listen address
+	Domains            []string     `yaml:"domains"`              // reloadable; each entry: domain or list-file path
+	Record             string       `yaml:"record"`               // reloadable; JSONL output file ("" = stdout)
+	CADir              string       `yaml:"ca_dir"`               // root CA directory
+	InsecureSkipVerify bool         `yaml:"insecure_skip_verify"` // reloadable
+	BodyLimit          int64        `yaml:"body_limit"`           // reloadable
+	Verbose            bool         `yaml:"verbose"`              // reloadable
+	Script             ScriptConfig `yaml:"script"`               // startup-only
+	Tun                TunConfig    `yaml:"tun"`
+}
+
+// ScriptConfig groups the JS rule-engine options; all of them are
+// startup-only. Timeout stays a string in YAML so expressions like "5s" work;
+// empty, zero or negative durations all fall back to the engine's default.
+type ScriptConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Path    string `yaml:"path"`    // script file, resolved relative to the working directory
+	Timeout string `yaml:"timeout"` // duration string, e.g. "5s"
 }
 
 // TunConfig groups the tun-mode options; all of them are startup-only.
@@ -57,7 +68,9 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Validate rejects configurations that cannot start a useful session.
+// Validate rejects configurations that cannot start a useful session. It also
+// normalizes the script block: a non-empty script.path implies enabled, so
+// setting only the path in YAML is enough to turn the rule engine on.
 func (c *Config) Validate() error {
 	if c.Mode != "" && c.Mode != "proxy" && c.Mode != "tun" {
 		return fmt.Errorf("config: invalid mode %q (proxy|tun)", c.Mode)
@@ -67,6 +80,26 @@ func (c *Config) Validate() error {
 	}
 	if c.Tun.MTU < 0 {
 		return errors.New("config: tun.mtu must be >= 0")
+	}
+	if !c.Script.Enabled && c.Script.Path != "" {
+		c.Script.Enabled = true
+	}
+	if c.Script.Enabled {
+		if c.Script.Path == "" {
+			return errors.New("config: script.path is required when script is enabled")
+		}
+		st, err := os.Stat(c.Script.Path)
+		if err != nil {
+			return fmt.Errorf("config: script.path: %w", err)
+		}
+		if st.IsDir() {
+			return fmt.Errorf("config: script.path %s is a directory, want a file", c.Script.Path)
+		}
+		if c.Script.Timeout != "" {
+			if _, err := time.ParseDuration(c.Script.Timeout); err != nil {
+				return fmt.Errorf("config: script.timeout: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -119,6 +152,11 @@ func Diff(old, new *Config) (Reloadable, []string) {
 	}
 	if !reflect.DeepEqual(old.Tun, new.Tun) {
 		ignored = append(ignored, "tun")
+	}
+	if old.Script.Enabled != new.Script.Enabled ||
+		old.Script.Path != new.Script.Path ||
+		old.Script.Timeout != new.Script.Timeout {
+		ignored = append(ignored, "script")
 	}
 	return r, ignored
 }

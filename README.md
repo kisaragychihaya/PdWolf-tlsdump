@@ -43,6 +43,10 @@ ca_dir: ./ca
 insecure_skip_verify: false
 body_limit: 16384
 verbose: false
+script:                  # JS 规则引擎（启动时一次性生效）
+  enabled: false         # path 非空时自动置为 true
+  path: ""               # 脚本文件路径
+  timeout: 5s            # 单次执行超时，缺省 5s
 tun:                     # tun 模式参数（仅 mode: tun 时生效）
   name: tlsdump
   mtu: 1420
@@ -61,7 +65,7 @@ tun:                     # tun 模式参数（仅 mode: tun 时生效）
 - `insecure_skip_verify`
 - `verbose`
 
-`mode`、`listen`、`ca_dir`、`tun.*` 是启动时一次性生效的字段，改动会被记录 Warn 日志并忽略，需重启生效。配置文件语法错误时程序记 Error 日志并沿用旧配置，修复后下个周期自动生效。从文件中删除 `body_limit` 字段会保持当前值不变（不会归零）；`domains` 重载为空列表会被拒绝并沿用旧白名单。
+`mode`、`listen`、`ca_dir`、`script.*`、`tun.*` 是启动时一次性生效的字段，改动会被记录 Warn 日志并忽略，需重启生效。配置文件语法错误时程序记 Error 日志并沿用旧配置，修复后下个周期自动生效。从文件中删除 `body_limit` 字段会保持当前值不变（不会归零）；`domains` 重载为空列表会被拒绝并沿用旧白名单。
 
 ## 用法
 
@@ -93,6 +97,8 @@ tlsdump -v -insecure-skip-verify -body-limit 65536 ...
 | `-ca-dir` | 根证书目录，默认 `./ca`（自动创建 ca.crt/ca.key） |
 | `-insecure-skip-verify` | 跳过上游 TLS 校验（上游自签/ pinning 场景） |
 | `-body-limit` | 每个请求/响应体最多记录的字节数，默认 16384 |
+| `-script` | JS 规则脚本路径（空 = 不启用；脚本错误会让启动失败） |
+| `-script-timeout` | 单次脚本执行超时，默认 5s |
 | `-tun-name` / `-tun-mtu` / `-tun-no-route` / `-tun-physical-iface` | tun 模式参数 |
 | `-tun-reset` | 清理上次运行残留的路由/网卡地址后退出（见下文注意事项） |
 | `-tun-exclude-domains` | 额外豁免的域名（逗号分隔或文件路径），其流量完全不经过 tun |
@@ -116,6 +122,36 @@ tlsdump -v -insecure-skip-verify -body-limit 65536 ...
 - `mode`：`mitm`（HTTPS 解密）或 `http`（明文 HTTP）。
 - 非 UTF-8 的 body 做 base64 编码存放。
 - 超 `-body-limit` 的 body 截断并标记 `*_body_truncated`。
+
+## 脚本改写
+
+`-script <文件>`（或 YAML 的 `script.path`）让白名单域名的请求/响应经过一个 JS 文件改写，引擎为 goja（ES5.1+）：
+
+```js
+var rules = [
+  {
+    pattern: "^https://api\\.example\\.com/",  // Go 正则，匹配完整 URL；首个命中生效
+    rewriteRequest: function (req) {
+      req.headers["X-Debug"] = "1";
+      req.path = req.path.replace("/api/", "/api/v2/");
+    },
+    rewriteResponse: function (resp) {
+      resp.status = 200;
+      resp.headers["X-Rewritten"] = "yes";
+      resp.body = resp.body.replace("foo", "bar");
+    }
+  }
+];
+```
+
+- 请求对象字段：`method`、`url`、`scheme`、`host`、`path`、`headers`、`body`、`bodyEncoding`；响应对象字段：`status`、`statusText`、`headers`、`body`、`bodyEncoding`。改 `url` 优先，否则用 `scheme`/`host`/`path` 重新拼装。
+- hook 可原地改对象，也可返回新对象（返回值优先）；两个 hook 都可省略。
+- body 是合法 UTF-8 时按文本给出，否则 `body` 为 base64 且 `bodyEncoding: "base64"`。
+- 改写后 `Content-Length` / `Transfer-Encoding` 由新 body 重新推导；记录的是改写后实际收发的请求与响应。
+- 响应带 `Content-Encoding: gzip` 或 `deflate` 时，body 会先解压再交给 `rewriteResponse`，脚本改完后按原编码重新压缩并恢复该响应头（`Content-Length` 按压缩后长度重算）；记录里存的是解压后的明文 body。解压失败则跳过改写、原样转发。其他编码（如 `br`）不做处理，脚本看到的是原始字节。
+- 脚本加载失败（语法错误、顶层异常、`rules` 缺失、正则非法）会让启动直接失败；单个 hook 抛异常或超时只记 Warn 并转发原始流量。
+- 只对白名单命中的解密流量生效；WebSocket 握手不改写；`script.*` 启动时一次性生效，改脚本需重启。
+- 局限：出口连接在改写前已确定，改 `host` 只影响 Host 头/URL，不会真的换服务器；有 `rewriteResponse` 时整个响应体会读进内存（无该 hook 时仍流式转发）。
 
 ## 注意事项
 

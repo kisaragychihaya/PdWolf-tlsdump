@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -135,5 +136,100 @@ func TestDiffIdentical(t *testing.T) {
 	}
 	if len(ignored) != 0 {
 		t.Errorf("expected no ignored fields, got %v", ignored)
+	}
+}
+
+// writeTempFile creates content under a fresh temp dir and returns its path.
+func writeTempFile(t *testing.T, name, content string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func TestLoadScriptBlock(t *testing.T) {
+	js := writeTempFile(t, "rules.js", "var rules = [];\n")
+	// Single quotes keep Windows backslashes literal in YAML.
+	p := writeTemp(t, fmt.Sprintf(`
+domains:
+  - example.com
+script:
+  path: '%s'
+  timeout: 250ms
+`, js))
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Script.Enabled {
+		t.Error("script.enabled should be auto-enabled when path is set")
+	}
+	if cfg.Script.Path != js || cfg.Script.Timeout != "250ms" {
+		t.Errorf("script = %+v", cfg.Script)
+	}
+}
+
+func TestValidateScript(t *testing.T) {
+	js := writeTempFile(t, "rules.js", "var rules = [];\n")
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "nope.js")
+
+	cases := []struct {
+		name   string
+		script ScriptConfig
+		ok     bool
+	}{
+		{"disabled and no path", ScriptConfig{}, true},
+		{"enabled with existing file", ScriptConfig{Enabled: true, Path: js}, true},
+		{"enabled with timeout", ScriptConfig{Enabled: true, Path: js, Timeout: "2s"}, true},
+		{"path only auto-enables", ScriptConfig{Path: js}, true},
+		{"path only with bad timeout", ScriptConfig{Path: js, Timeout: "soon"}, false},
+		{"enabled without path", ScriptConfig{Enabled: true}, false},
+		{"enabled with missing file", ScriptConfig{Enabled: true, Path: missing}, false},
+		{"enabled with directory", ScriptConfig{Enabled: true, Path: dir}, false},
+		{"bad timeout", ScriptConfig{Enabled: true, Path: js, Timeout: "5"}, false},
+		{"negative timeout parses", ScriptConfig{Enabled: true, Path: js, Timeout: "-1s"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Script: tc.script}
+			err := cfg.Validate()
+			if (err == nil) != tc.ok {
+				t.Fatalf("Validate() = %v, want ok=%v", err, tc.ok)
+			}
+			if err == nil && tc.script.Path != "" && !cfg.Script.Enabled {
+				t.Error("Validate() should auto-enable script when path is set")
+			}
+		})
+	}
+}
+
+func TestDiffScriptIsStartupOnly(t *testing.T) {
+	base := ScriptConfig{Enabled: true, Path: "a.js", Timeout: "5s"}
+	cases := []struct {
+		name string
+		nw   ScriptConfig
+		want bool // script expected in ignored
+	}{
+		{"unchanged", base, false},
+		{"enabled toggled", ScriptConfig{Enabled: false, Path: "a.js", Timeout: "5s"}, true},
+		{"path changed", ScriptConfig{Enabled: true, Path: "b.js", Timeout: "5s"}, true},
+		{"timeout changed", ScriptConfig{Enabled: true, Path: "a.js", Timeout: "10s"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, ignored := Diff(&Config{Script: base}, &Config{Script: tc.nw})
+			if r.Any() {
+				t.Errorf("script changes must not be reloadable, got %+v", r)
+			}
+			if got := len(ignored) > 0; got != tc.want {
+				t.Fatalf("ignored = %v, want script reported=%v", ignored, tc.want)
+			}
+			if tc.want && (len(ignored) != 1 || ignored[0] != "script") {
+				t.Errorf("ignored = %v, want [script]", ignored)
+			}
+		})
 	}
 }
