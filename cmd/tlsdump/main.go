@@ -40,6 +40,10 @@ type options struct {
 	domains          []string
 	record           string
 	caDir            string
+	crossCert        string
+	crossKey         string
+	signCert         string
+	signKey          string
 	insecure         bool
 	bodyLimit        int64
 	verbose          bool
@@ -60,6 +64,10 @@ func run() error {
 		domains          = flag.String("domains", "", "comma-separated domains, or path to a domain list file (# comments allowed)")
 		recordPath       = flag.String("record", "", "JSONL output file (default stdout)")
 		caDir            = flag.String("ca-dir", "./ca", "CA certificate directory")
+		crossCert        = flag.String("cross-cert", "", "PEM file of an external CA certificate (chain) used to cross-sign the local root, so clients already trusting that CA accept the chains")
+		crossKey         = flag.String("cross-key", "", "PEM private key matching -cross-cert")
+		signCert         = flag.String("sign-cert", "", "PEM file of an external CA certificate (chain); the external CA key signs leaf certificates directly (use for intermediates with a pathlen constraint)")
+		signKey          = flag.String("sign-key", "", "PEM private key matching -sign-cert")
 		insecure         = flag.Bool("insecure-skip-verify", false, "skip upstream TLS verification (pinning/self-signed upstreams)")
 		bodyLimit        = flag.Int64("body-limit", 16384, "max body bytes recorded per request/response")
 		scriptPath       = flag.String("script", "", "JS script for request/response rewriting (empty = disabled)")
@@ -141,6 +149,10 @@ func run() error {
 		domains:          pickList("domains", *domains, fileCfg.Domains),
 		record:           pickStr("record", *recordPath, fileCfg.Record),
 		caDir:            pickStr("ca-dir", *caDir, fileCfg.CADir),
+		crossCert:        pickStr("cross-cert", *crossCert, fileCfg.CrossCert),
+		crossKey:         pickStr("cross-key", *crossKey, fileCfg.CrossKey),
+		signCert:         pickStr("sign-cert", *signCert, fileCfg.SignCert),
+		signKey:          pickStr("sign-key", *signKey, fileCfg.SignKey),
 		insecure:         pickBool("insecure-skip-verify", *insecure, fileCfg.InsecureSkipVerify),
 		bodyLimit:        pickInt64("body-limit", *bodyLimit, fileCfg.BodyLimit),
 		verbose:          pickBool("v", *verbose, fileCfg.Verbose),
@@ -174,6 +186,36 @@ func run() error {
 		return err
 	}
 	slog.Info("CA ready", "dir", opts.caDir)
+
+	if opts.crossCert != "" || opts.crossKey != "" || opts.signCert != "" || opts.signKey != "" {
+		if opts.crossCert != "" && opts.signCert != "" {
+			return fmt.Errorf("cross-cert and sign-cert are mutually exclusive (cross-sign vs direct signing)")
+		}
+		certPath, keyPath := opts.crossCert, opts.crossKey
+		mode := "cross-signing"
+		enable := ca.EnableCrossIssuer
+		if opts.signCert != "" {
+			certPath, keyPath = opts.signCert, opts.signKey
+			mode = "direct signing"
+			enable = ca.EnableDirectSigner
+		}
+		if certPath == "" || keyPath == "" {
+			return fmt.Errorf("cert and key must be set together (cross-cert/cross-key or sign-cert/sign-key)")
+		}
+		certPEM, err := os.ReadFile(certPath)
+		if err != nil {
+			return fmt.Errorf("read external CA certificate: %w", err)
+		}
+		keyPEM, err := os.ReadFile(keyPath)
+		if err != nil {
+			return fmt.Errorf("read external CA key: %w", err)
+		}
+		issuer, err := enable(certPEM, keyPEM)
+		if err != nil {
+			return fmt.Errorf("enable %s: %w", mode, err)
+		}
+		slog.Info("external CA enabled", "mode", mode, "issuer", issuer)
+	}
 
 	// The script engine is startup-only: a failed load is fatal rather than a
 	// silent downgrade to no rewriting.

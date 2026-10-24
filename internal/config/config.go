@@ -22,6 +22,10 @@ type Config struct {
 	Domains            []string     `yaml:"domains"`              // reloadable; each entry: domain or list-file path
 	Record             string       `yaml:"record"`               // reloadable; JSONL output file ("" = stdout)
 	CADir              string       `yaml:"ca_dir"`               // root CA directory
+	CrossCert          string       `yaml:"cross_cert"`           // PEM chain of an external CA that cross-signs the local root
+	CrossKey           string       `yaml:"cross_key"`            // private key matching cross_cert
+	SignCert           string       `yaml:"sign_cert"`            // PEM chain of an external CA that signs leaves directly
+	SignKey            string       `yaml:"sign_key"`             // private key matching sign_cert
 	InsecureSkipVerify bool         `yaml:"insecure_skip_verify"` // reloadable
 	BodyLimit          int64        `yaml:"body_limit"`           // reloadable
 	Verbose            bool         `yaml:"verbose"`              // reloadable
@@ -149,6 +153,18 @@ func Diff(old, new *Config) (Reloadable, []string) {
 	}
 	if old.CADir != new.CADir {
 		ignored = append(ignored, "ca_dir")
+	}
+	if old.CrossCert != new.CrossCert {
+		ignored = append(ignored, "cross_cert")
+	}
+	if old.CrossKey != new.CrossKey {
+		ignored = append(ignored, "cross_key")
+	}
+	if old.SignCert != new.SignCert {
+		ignored = append(ignored, "sign_cert")
+	}
+	if old.SignKey != new.SignKey {
+		ignored = append(ignored, "sign_key")
 	}
 	if !reflect.DeepEqual(old.Tun, new.Tun) {
 		ignored = append(ignored, "tun")

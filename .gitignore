@@ -8,6 +8,11 @@
 # 根 CA（含私钥，绝不提交）
 /ca/
 
+# 审计材料：eMudhra 事件公开可重算的弱私钥，仅保留本地方便授权设备审计
+# （audit/emudhra/README.md 有来源与复现说明）。按项目惯例 CA 私钥不入库；
+# 确需入库：git add -f audit/
+/audit/
+
 # wintun.dll 不入库：CI 构建 Windows 目标前会从 wintun.net 官方包
 # 按目标架构拉取（见 .github/workflows/build.yml）；
 # 本地 Windows 构建需手动放置，见 README「构建」一节。

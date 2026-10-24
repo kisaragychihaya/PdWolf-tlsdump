@@ -40,6 +40,10 @@ domains:                 # 白名单；每项可以是域名，也可以是域�
   - api.example.com
 record: rec.jsonl        # JSONL 输出文件，缺省 stdout
 ca_dir: ./ca
+# cross_cert: issuer.crt   # 外部 CA 证书链（交叉签名模式，与 cross_key 成对）
+# cross_key: issuer.key
+# sign_cert: issuer.crt    # 外部 CA 证书链（直接签名模式，与 sign_key 成对）
+# sign_key: issuer.key
 insecure_skip_verify: false
 body_limit: 16384
 verbose: false
@@ -65,7 +69,7 @@ tun:                     # tun 模式参数（仅 mode: tun 时生效）
 - `insecure_skip_verify`
 - `verbose`
 
-`mode`、`listen`、`ca_dir`、`script.*`、`tun.*` 是启动时一次性生效的字段，改动会被记录 Warn 日志并忽略，需重启生效。配置文件语法错误时程序记 Error 日志并沿用旧配置，修复后下个周期自动生效。从文件中删除 `body_limit` 字段会保持当前值不变（不会归零）；`domains` 重载为空列表会被拒绝并沿用旧白名单。
+`mode`、`listen`、`ca_dir`、`cross_cert`、`cross_key`、`sign_cert`、`sign_key`、`script.*`、`tun.*` 是启动时一次性生效的字段，改动会被记录 Warn 日志并忽略，需重启生效。配置文件语法错误时程序记 Error 日志并沿用旧配置，修复后下个周期自动生效。从文件中删除 `body_limit` 字段会保持当前值不变（不会归零）；`domains` 重载为空列表会被拒绝并沿用旧白名单。
 
 ## 用法
 
@@ -95,6 +99,8 @@ tlsdump -v -insecure-skip-verify -body-limit 65536 ...
 | `-domains` | 逗号分隔域名，或域名列表文件路径 |
 | `-record` | JSONL 输出文件，默认 stdout |
 | `-ca-dir` | 根证书目录，默认 `./ca`（自动创建 ca.crt/ca.key） |
+| `-cross-cert` / `-cross-key` | 外部 CA 证书链 + 私钥（PEM）：交叉签名本地根，使已信任该外部 CA 的客户端无需安装本地根（见下文「外部 CA 签名」） |
+| `-sign-cert` / `-sign-key` | 外部 CA 证书链 + 私钥（PEM）：直接用外部 CA 私钥签叶子（外部中间 CA 带 `pathlen` 约束时必须用此模式） |
 | `-insecure-skip-verify` | 跳过上游 TLS 校验（上游自签/ pinning 场景） |
 | `-body-limit` | 每个请求/响应体最多记录的字节数，默认 16384 |
 | `-script` | JS 规则脚本路径（空 = 不启用；脚本错误会让启动失败） |
@@ -110,6 +116,28 @@ tlsdump -v -insecure-skip-verify -body-limit 65536 ...
 - **Windows**：双击 `ca.crt` → 安装证书 → 本地计算机 → 受信任的根证书颁发机构（或 `certutil -addstore Root ca.crt`，需管理员）。
 - **curl**：`curl -x 127.0.0.1:8080 --cacert ca/ca.crt https://example.com/`（HTTP 代理）；SOCKS5 用 `curl -x socks5h://127.0.0.1:8080 --cacert ca/ca.crt https://example.com/`（`socks5h://` 让代理解析域名，白名单才能命中）。
 - **系统级**：把 `ca.crt` 导入系统信任库后所有客户端无感。
+
+## 外部 CA 签名（免安装根证书）
+
+针对**无法在信任库安装本地根**的受控审计对象（如老旧/嵌入式/IoT 设备），tlsdump 可以用一个外部 CA 的证书+私钥签发解密链，使已信任该外部 CA 的设备直接接受。两种模式互斥（`cross-*` 与 `sign-*` 只能选一组，证书文件首张 PEM 为签发用中间 CA，其余 PEM 块追加进服务链）：
+
+- **交叉签名模式**（`-cross-cert issuer.crt -cross-key issuer.key`）：外部 CA 私钥给本地根签一张 cross-cert（subject/公钥不变，issuer 换成外部 CA），服务链 `叶子 → cross-cert → 外部中间 CA`。要求外部中间 CA **无 pathlen 约束**。
+- **直接签名模式**（`-sign-cert issuer.crt -sign-key issuer.key`）：叶子直接由外部 CA 私钥签发，服务链 `叶子 → 外部中间 CA`。外部中间 CA 带 `pathlen:0`（公共 Web PKI 通行配置）也能通过验证，**带 pathlen 约束的外部 CA 必须用这个模式**。
+
+判定方法：`openssl x509 -in issuer.crt -noout -ext basicConstraints`，看到 `pathlen:0` 就用 `-sign-*`。
+
+典型场景：2026-10 披露的 eMudhra 弱私钥事件中，8 张中间 CA 证书（`EM DV/OV/EV TLS CA - G3B/G3C` 等，私钥为可从公网证书直接重算的 P-384 小整数）已 `cACompromise` 吊销且均为 `pathlen:0`。对**仍信任这些链且不校验吊销/CT 的未打补丁设备进行授权审计**时：
+
+```bash
+# issuer.key 为与证书匹配的 SEC1/PKCS#8 PEM 私钥（该事件中私钥即公开小整数 d）
+# 中间 CA 证书可从披露站 impacted-intermediates.json / chains.zip 取得（共 16 张）
+tlsdump -domains example.com -record rec.jsonl \
+    -sign-cert EM-DV-TLS-CA-G3B.crt.pem -sign-key issuer.key
+```
+
+每个 EM 私钥对应**两张**中间 CA 证书（emSign Root TLS CA - G3 签发 / Sectigo AAA Certificate Services 交叉签名），同一张叶子两条链都能验过；AAA 根在更老设备上覆盖率更高。一个实例一次只能服务一条链，多链覆盖请开多个实例（不同 `-listen` 端口）分别测试。
+
+授权边界：该功能仅用于**你拥有或获得书面授权**的设备的安全检查；它同时是检测"哪些客户端不校验证书吊销状态"的探针——目标设备接受此类链即证明其信任库/运行时未打补丁。
 
 ## 记录格式
 
@@ -192,7 +220,8 @@ var rules = [
 - 上游 TLS 默认严格校验；命中证书 pinning 或上游自签时打开 `-insecure-skip-verify`。
 - **不要与其他 TUN/虚拟网卡类工具同时运行**（如 Clash Verge 的 TUN 模式）：它们使用 fake-ip 网段和同样的 /1 接管路由，互相冲突会导致断网。使用前确保相关进程（含残留的 `clash-core-service.exe` 之类系统服务进程）已退出。
 - **Windows 下 curl 验证 MITM 需要** `--cacert ca/ca.crt --ssl-no-revoke`（schannel 会对无 CRL 的本地 CA 报吊销状态未知）。
-- 解密流量由本地动态签发叶子证书完成（RSA-2048，SAN=dns，缓存复用）。
+- 解密流量由本地动态签发叶子证书完成（RSA-2048，SAN=dns，缓存复用）；启用 `-cross-*`/`-sign-*` 时改由外部 CA 签发，服务链相应变化（见「外部 CA 签名」）。
+- 外部 CA 签名模式的目标设备必须不校验吊销（OCSP/CRL）与 CT；已打补丁的浏览器/运行时（Go ≥1.27.3、Python certifi ≥2026.10.19、Electron ≥44.9.1、NSS 3.131.1 等）会拒绝此类链。
 - HTTP/2：客户端 ALPN=h2 时按 h2 解密转发；其余按 HTTP/1.1 处理。
 - UDP（含 DNS）在 tun 模式下按原目的地址双向转发，空闲 2 分钟断开；tun 模式仅接管 IPv4（v6 流量不受影响）。
 - 已知限制：Windows 下 IP_UNICAST_IF 字节序按 winsock 文档（网络字节序）处理，个别环境如出口异常可用 `-tun-physical-iface` 显式指定；转发 HTTP 请求时若客户端未带 User-Agent 不会注入默认头；超大 body 只记录前 `-body-limit` 字节。
