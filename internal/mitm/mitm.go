@@ -214,17 +214,13 @@ func (h *Handler) handleTLS(ctx context.Context, bc *bufferedConn, dstAddr, sni,
 }
 
 // serveH2 runs an HTTP/2 server over the terminated TLS connection and
-// forwards each request upstream over HTTP/2.
+// forwards each request upstream using the protocol the upstream negotiated.
 func (h *Handler) serveH2(ctx context.Context, conn *tls.Conn, dstAddr, sni, host, clientAddr string) {
-	transport := &http2.Transport{
-		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-			serverName := sni
-			if serverName == "" {
-				serverName = host
-			}
-			return h.dialTLS(ctx, addr, serverName, []string{"h2"})
-		},
+	serverName := sni
+	if serverName == "" {
+		serverName = host
 	}
+	transport := newUpstreamDispatcher(ctx, h, dstAddr, serverName)
 	handler := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		h.handleH2Request(ctx, w, req, transport, host, clientAddr)
 	})
@@ -232,7 +228,7 @@ func (h *Handler) serveH2(ctx context.Context, conn *tls.Conn, dstAddr, sni, hos
 	srv.ServeConn(conn, &http2.ServeConnOpts{Context: ctx, Handler: handler})
 }
 
-func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, req *http.Request, transport *http2.Transport, sni, clientAddr string) {
+func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, req *http.Request, transport http.RoundTripper, sni, clientAddr string) {
 	var reqRaw []byte
 	var reqTrunc bool
 	if req.Body != nil {
@@ -261,6 +257,11 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
 		slog.Debug("h2 upstream round trip failed", "host", host, "err", err)
+		summary := strings.NewReplacer("\r", " ", "\n", " ").Replace(err.Error())
+		if strings.Contains(summary, "ALPN") {
+			summary = "upstream ALPN/h2 negotiation failed: " + summary
+		}
+		w.Header().Set("X-Tlsdump-Error", summary)
 		http.Error(w, "tlsdump upstream error", http.StatusBadGateway)
 		return
 	}
@@ -292,6 +293,13 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 	w.WriteHeader(resp.StatusCode)
 	_, copyErr := io.Copy(w, respBody)
 
+	recBody, recTrunc := lb.bytes(), lb.truncated()
+	if !buffered {
+		// The record holds plaintext even without a response hook; the client
+		// still receives the original compressed bytes.
+		recBody, recTrunc = decodeRecordedBody(recBody, recTrunc, resp.Header.Get("Content-Encoding"), h.runtime().bodyLimit)
+	}
+
 	e := &record.Entry{
 		Time:        time.Now(),
 		Client:      clientAddr,
@@ -304,8 +312,8 @@ func (h *Handler) handleH2Request(ctx context.Context, w http.ResponseWriter, re
 		RespHeaders: resp.Header.Clone(),
 		ReqBody:     record.EncodeBody(reqRaw),
 		ReqTrunc:    reqTrunc,
-		RespBody:    record.EncodeBody(lb.bytes()),
-		RespTrunc:   lb.truncated(),
+		RespBody:    record.EncodeBody(recBody),
+		RespTrunc:   recTrunc,
 	}
 	h.runtime().log.Log(e)
 
@@ -407,6 +415,13 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 		writeErr := resp.Write(clientW)
 		resp.Body.Close()
 
+		recBody, recTrunc := lb.bytes(), lb.truncated()
+		if !buffered {
+			// The record holds plaintext even without a response hook; the
+			// client still receives the original compressed bytes.
+			recBody, recTrunc = decodeRecordedBody(recBody, recTrunc, resp.Header.Get("Content-Encoding"), h.runtime().bodyLimit)
+		}
+
 		e := &record.Entry{
 			Time:        time.Now(),
 			Client:      clientAddr,
@@ -419,8 +434,8 @@ func (h *Handler) serveHTTP1(ctx context.Context, clientW net.Conn, clientR *buf
 			RespHeaders: resp.Header.Clone(),
 			ReqBody:     record.EncodeBody(reqRaw),
 			ReqTrunc:    reqTrunc,
-			RespBody:    record.EncodeBody(lb.bytes()),
-			RespTrunc:   lb.truncated(),
+			RespBody:    record.EncodeBody(recBody),
+			RespTrunc:   recTrunc,
 		}
 		h.runtime().log.Log(e)
 
@@ -454,8 +469,9 @@ func (h *Handler) rewriteRequest(req *http.Request, body []byte) (*http.Request,
 // replaced by a reader over the (possibly rewritten) bytes; buffered reports
 // whether that happened, letting the caller skip re-teeing the body.
 //
-// A gzip/deflate body is decoded before the hook runs and re-encoded after it,
-// so scripts always operate on plaintext. recordBody is the plaintext the hook
+// A gzip/deflate/brotli body is decoded before the hook runs and re-encoded
+// after it, so scripts always operate on plaintext. recordBody is the plaintext
+// the hook
 // produced (what callers record); out.Body carries the bytes to send, which are
 // compressed again when the upstream response was.
 //

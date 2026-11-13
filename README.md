@@ -176,7 +176,8 @@ var rules = [
 - hook 可原地改对象，也可返回新对象（返回值优先）；两个 hook 都可省略。
 - body 是合法 UTF-8 时按文本给出，否则 `body` 为 base64 且 `bodyEncoding: "base64"`。
 - 改写后 `Content-Length` / `Transfer-Encoding` 由新 body 重新推导；记录的是改写后实际收发的请求与响应。
-- 响应带 `Content-Encoding: gzip` 或 `deflate` 时，body 会先解压再交给 `rewriteResponse`，脚本改完后按原编码重新压缩并恢复该响应头（`Content-Length` 按压缩后长度重算）；记录里存的是解压后的明文 body。解压失败则跳过改写、原样转发。其他编码（如 `br`）不做处理，脚本看到的是原始字节。
+- 响应带 `Content-Encoding: gzip`、`deflate` 或 `br`（brotli）时，body 会先解压再交给 `rewriteResponse`，脚本改完后按原编码重新压缩并恢复该响应头（`Content-Length` 按压缩后长度重算）；记录里存的是解压后的明文 body。解压失败则跳过改写、原样转发。其他编码（如 `zstd`）不做处理，脚本看到的是原始字节。
+- 即使没有任何脚本 hook（纯记录场景），上述编码的响应在 JSONL 里同样记录解压后的明文；转发给客户端的仍是原始压缩字节，不受影响。仅当解压失败或压缩字节超出 `body_limit` 导致截断时，记录里才保留原始字节。
 - 脚本加载失败（语法错误、顶层异常、`rules` 缺失、正则非法）会让启动直接失败；单个 hook 抛异常或超时只记 Warn 并转发原始流量。
 - 只对白名单命中的解密流量生效；WebSocket 握手不改写；`script.*` 启动时一次性生效，改脚本需重启。
 - 局限：出口连接在改写前已确定，改 `host` 只影响 Host 头/URL，不会真的换服务器；有 `rewriteResponse` 时整个响应体会读进内存（无该 hook 时仍流式转发）。

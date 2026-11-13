@@ -22,7 +22,7 @@ go test ./...         # 运行测试
 ```
 
 - 无 Makefile、无 linter 配置；标准 Go 工具链即可。CI 为 GitHub Actions（`.github/workflows/build.yml`）：push 到 main / tag `v*` / 手动触发时交叉编译 windows amd64+arm64、linux amd64+arm64、darwin arm64 并上传 artifact（tag 时自动发 Release）。
-- 主要依赖（见 `go.mod`）：`gvisor.dev/gvisor`（用户态 TCP/IP 协议栈，tun 模式核心）、`golang.zx2c4.com/wireguard`（tun 设备抽象）、`golang.org/x/net`（HTTP/2）、`golang.org/x/sys`、`gopkg.in/yaml.v3`（配置文件解析）、`github.com/dop251/goja`（纯 Go 的 ES5.1+ 引擎，`internal/script` 用）。
+- 主要依赖（见 `go.mod`）：`gvisor.dev/gvisor`（用户态 TCP/IP 协议栈，tun 模式核心）、`golang.zx2c4.com/wireguard`（tun 设备抽象）、`golang.org/x/net`（HTTP/2）、`golang.org/x/sys`、`gopkg.in/yaml.v3`（配置文件解析）、`github.com/dop251/goja`（纯 Go 的 ES5.1+ 引擎，`internal/script` 用）、`github.com/andybalholm/brotli`（纯 Go brotli，`internal/mitm/compression.go` 用）。
 - Windows 下 `internal/tun/wintun_windows.go` 通过 `//go:embed wintun.dll` 内嵌驱动 DLL，构建产物运行时会自动释放到可执行文件旁。**该 DLL 不入库**（已 gitignore）：CI 构建 Windows 目标前会从 wintun.net 官方包按目标架构下载到 `internal/tun/wintun.dll`；本地 Windows 构建需手动放置（见 README「构建」一节）。仓库根目录的 `wintun.dll` 是运行时释放产物，与嵌入的 DLL 是同一份文件。
 
 ## 代码组织
@@ -38,7 +38,7 @@ internal/
   tun/exclude_*.go         平台相关：-tun-exclude-domains 域名豁免（/32 主机路由钉到物理网卡）
   tun/wintun_*.go          平台相关：Windows 释放内嵌 wintun.dll 并固定网卡 GUID；macOS 设备名映射为 utun
   mitm/mitm.go             核心：嗅探首字节 → TLS/明文 HTTP/未知 分类 → 解密转发或 bypass；接入脚本改写（rewriteRequest / rewriteResponse）
-  mitm/compression.go      响应体的 gzip/deflate 解压与重压（脚本改写前后自动转明文），deflate 兼容 zlib 包装与裸 DEFLATE
+  mitm/compression.go      响应体的 gzip/deflate/br 解压与重压（脚本改写前后自动转明文），deflate 兼容 zlib 包装与裸 DEFLATE，br 用 andybalholm/brotli 纯 Go 实现
   certmgr/manager.go       本地根 CA（RSA-2048，./ca/ca.crt + ca.key）与按域名动态签发叶子证书（内存缓存）；支持外部 CA 两种模式：交叉签名本地根（EnableCrossIssuer，链 叶子→cross-cert→外部中间CA）与外部 CA 私钥直接签叶子（EnableDirectSigner，链 叶子→外部中间CA，兼容 pathlen:0 中间 CA）
   filter/filter.go         域名白名单匹配（后缀匹配，含子域名，大小写不敏感）
   record/record.go         JSONL 记录器：每行一条 Entry；body 超限时截断；非 UTF-8 body 走 base64
@@ -59,7 +59,7 @@ internal/
 - tun 模式：netstack 只接管 IPv4；出口连接必须通过 `newBoundDialer` 绑定物理网卡，否则流量会绕回 tun 形成回路；UDP 按原目的地址双向转发，空闲 2 分钟断开。
 - 记录通过 `record.Logger`（mutex 串行化写）输出，`-record` 缺省写到 stdout。
 - 热重载（`-config`）：`mitm.Handler` 的白名单/记录器/body 上限/上游 TLS 校验存放在 `atomic.Pointer[mitmRuntime]` 中，经 `SetRuntime` 整体原子替换；可重载字段为 `domains`、`record`、`body_limit`、`insecure_skip_verify`、`verbose`，`mode`/`listen`/`ca_dir`/`cross_cert`/`cross_key`/`sign_cert`/`sign_key`/`script.*`/`tun.*` 改动只记 Warn 需重启。切换 `record` 文件时旧文件保持打开到进程退出，避免与在途 `Log` 写竞争。
-- 脚本改写（`-script` / YAML `script.*`，启动时一次性生效）：`main` 用 `script.NewEngine` 建引擎后交给 `Handler.ScriptEngine`（nil = 关闭）。HTTP/1.1 在 `serveHTTP1` 循环内、WebSocket 分支之后调 `rewriteRequest`；HTTP/2 在 `handleH2Request` 里调同一个辅助函数。响应侧走 `rewriteResponse`：仅当 `Engine.HasResponseHook(res)` 为真时才把上游 body 全部读入内存并可改写（`buffered=true`，重新推导 Content-Length/Transfer-Encoding），否则保持原来的 `TeeReader` 流式记录。hook 报错或超时一律 Warn + 转发原始流量；请求改写后记录的是实际发往上游的 method/URI/headers/body。响应体为 `gzip`/`deflate` 时，`rewriteResponse` 先经 `compression.go` 解压、临时移除 `Content-Encoding` 再交给 hook，改完按原编码重压并恢复该头（`Content-Length` 取压缩后长度）；返回的 `recordBody` 是解压后的明文，供 JSONL 记录，`out.Body` 才是发给客户端的字节。解压失败跳过改写原样转发；`br` 等不支持的编码不做转换。改写只对白名单命中的解密流量生效，WebSocket 握手不改写；出口连接在改写前已确定（CONNECT/tun 目标固定），改 `host` 只影响 Host 头/URL。
+- 脚本改写（`-script` / YAML `script.*`，启动时一次性生效）：`main` 用 `script.NewEngine` 建引擎后交给 `Handler.ScriptEngine`（nil = 关闭）。HTTP/1.1 在 `serveHTTP1` 循环内、WebSocket 分支之后调 `rewriteRequest`；HTTP/2 在 `handleH2Request` 里调同一个辅助函数。响应侧走 `rewriteResponse`：仅当 `Engine.HasResponseHook(res)` 为真时才把上游 body 全部读入内存并可改写（`buffered=true`，重新推导 Content-Length/Transfer-Encoding），否则保持原来的 `TeeReader` 流式记录（但 `decodeRecordedBody` 会先把记录侧的 gzip/deflate/br 字节转成明文再落 JSONL，转发字节不变；解压失败或原始字节已因 body_limit 截断则记原始字节）。hook 报错或超时一律 Warn + 转发原始流量；请求改写后记录的是实际发往上游的 method/URI/headers/body。响应体为 `gzip`/`deflate`/`br` 时，`rewriteResponse` 先经 `compression.go` 解压、临时移除 `Content-Encoding` 再交给 hook，改完按原编码重压并恢复该头（`Content-Length` 取压缩后长度）；返回的 `recordBody` 是解压后的明文，供 JSONL 记录，`out.Body` 才是发给客户端的字节。解压失败跳过改写原样转发；`zstd` 等不支持的编码不做转换。改写只对白名单命中的解密流量生效，WebSocket 握手不改写；出口连接在改写前已确定（CONNECT/tun 目标固定），改 `host` 只影响 Host 头/URL。
 
 ## 代码风格约定
 
@@ -76,7 +76,8 @@ internal/
   - `gateway_windows_test.go`（`//go:build windows`）：查询名为 `WLAN` 的网卡网关，依赖真实网络环境，无 WLAN 网卡的机器会失败。
   - `config/config_test.go`：YAML 加载（含未知字段拒绝）、`Validate`、`Diff` 的可重载/需重启分类。
   - `script/engine_test.go`：脚本加载失败的各种情形（语法错误、顶层异常、rules 缺失/非数组、pattern 缺失或非法、hook 非函数、加载超时）、URL/header/body/base64 body/host/path 改写、无匹配、首匹配优先、hook 返回新对象、JS 异常后仍可继续用、hook 死循环超时（`errors.Is(err, ErrTimeout)`）后引擎仍可用、响应改写、并发调用；`TestRewrittenRequestIsForwardable` 把改写后的请求真正写到 `httptest` 服务端，校验线上帧格式（单个 Content-Length、body 长度一致）。
-  - `mitm/compression_test.go`：gzip/deflate（含裸 DEFLATE）解压、重压往返、空 body、大小写、非法数据、不支持的编码，以及 `rewriteResponse` 端到端（解压 → hook → 重压，校验线上 Content-Length 与客户端可解压、解压失败原样回退、无 response hook 时保持流式）。
+  - `mitm/compression_test.go`：gzip/deflate（含裸 DEFLATE）/br 解压、重压往返、空 body、大小写、非法数据、不支持的编码、`decodeRecordedBody`（记录侧转明文/回退/重截断），以及 `rewriteResponse` 端到端（解压 → hook → 重压，校验线上 Content-Length 与客户端可解压、解压失败原样回退、无 response hook 时保持流式）。
+  - `mitm/upstream_test.go`：上游 ALPN 分发器单测（h2/http1.1/dial 失败/并发）、h2 客户端→HTTP/1.1-only 上游回归（h2-502 bug）、无 hook 时 JSONL 记录压缩响应明文而客户端仍收压缩字节（`TestH2RecordsPlaintextForCompressedResponse`）。
   - `certmgr/crosssign_test.go`：外部 CA 交叉签名/直接签名的链验证（对照玩具 PKI 用 `x509.Verify` 从外部根验通）、cross-cert 内容（subject/公钥=本地根、issuer/AKID=外部 CA）、pathlen 语义（交叉签名+`pathlen:0` 被拒、直接签名+`pathlen:0` 通过）、链文件附加证书、key 不匹配/非 CA 拒绝、openssl 多 PEM 块私钥（EC PARAMETERS 头）。
 - 其余包（`proxy` / `filter` / `record`）目前没有测试；改动这些包时如需验证，优先端到端跑一遍：proxy 模式下 `curl -x 127.0.0.1:8080 --cacert ca/ca.crt https://<白名单域名>/`（Windows 的 curl 还需 `--ssl-no-revoke`），检查输出的 JSONL 记录。外部 CA 签名模式建议用 `openssl s_client -proxy 127.0.0.1:8080 -connect <host>:443 -CAfile <外部根>.crt -verify_return_error` 做端到端链验证。
 - 手动验证 tun 模式需管理员/root，且**不要与其他 TUN 类工具（如 Clash TUN 模式）同时运行**；异常退出后用 `-tun-reset` 清理残留路由。

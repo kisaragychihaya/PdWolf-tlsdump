@@ -7,13 +7,16 @@ import (
 	"compress/zlib"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
+
+	"github.com/andybalholm/brotli"
 )
 
 // supportedEncodings lists the content codings the script path decodes before a
-// response hook runs and re-encodes afterwards. Anything else (br, zstd, ...)
+// response hook runs and re-encodes afterwards. Anything else (zstd, ...)
 // is passed through untouched and left for the client to decode.
-var supportedEncodings = []string{"gzip", "deflate"}
+var supportedEncodings = []string{"gzip", "deflate", "br"}
 
 // decompressBody decodes body according to the Content-Encoding value in
 // encoding. It returns the decoded body and the normalised coding name, or
@@ -41,6 +44,8 @@ func decompressBody(body []byte, encoding string) ([]byte, string, error) {
 		plain, err = gunzip(body)
 	case "deflate":
 		plain, err = inflate(body)
+	case "br":
+		plain, err = unbrotli(body)
 	default:
 		return nil, "", nil
 	}
@@ -70,10 +75,41 @@ func compressBody(body []byte, encoding string) ([]byte, error) {
 		if err := zw.Close(); err != nil {
 			return nil, fmt.Errorf("deflate: %w", err)
 		}
+	case "br":
+		bw := brotli.NewWriter(&buf)
+		if _, err := bw.Write(body); err != nil {
+			return nil, fmt.Errorf("br: %w", err)
+		}
+		if err := bw.Close(); err != nil {
+			return nil, fmt.Errorf("br: %w", err)
+		}
 	default:
 		return nil, fmt.Errorf("unsupported content encoding %q", encoding)
 	}
 	return buf.Bytes(), nil
+}
+
+// decodeRecordedBody converts a recorded response body to plaintext when its
+// Content-Encoding names a supported coding. The forwarded response is
+// untouched — the client still receives the original compressed bytes; only
+// the JSONL record is decoded. Truncated (record-limit) or undecodable bodies
+// are returned unchanged, so the record keeps the raw bytes it captured.
+// Decoded plaintext is re-capped at the record body limit.
+func decodeRecordedBody(raw []byte, truncated bool, encoding string, limit int64) ([]byte, bool) {
+	if truncated {
+		return raw, truncated
+	}
+	plain, coding, err := decompressBody(raw, encoding)
+	if err != nil {
+		slog.Warn("record: response decompression failed, recording original bytes", "encoding", encoding, "err", err)
+		return raw, truncated
+	}
+	if coding == "" {
+		return raw, truncated
+	}
+	lb := &limitedBuffer{limit: limit}
+	_, _ = lb.Write(plain)
+	return lb.bytes(), lb.truncated()
 }
 
 // normaliseEncoding lowercases encoding and reports whether it names a coding
@@ -99,6 +135,16 @@ func gunzip(body []byte) ([]byte, error) {
 	plain, err := io.ReadAll(zr)
 	if err != nil {
 		return nil, fmt.Errorf("gzip: %w", err)
+	}
+	return plain, nil
+}
+
+// unbrotli decodes a brotli stream.
+func unbrotli(body []byte) ([]byte, error) {
+	zr := brotli.NewReader(bytes.NewReader(body))
+	plain, err := io.ReadAll(zr)
+	if err != nil {
+		return nil, fmt.Errorf("br: %w", err)
 	}
 	return plain, nil
 }
